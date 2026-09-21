@@ -761,6 +761,9 @@ func validateStorageURISpec(storageUri *StorageUri) error {
 	if storageUri.Uri == "" {
 		return errors.New("storage URI cannot be empty")
 	}
+	if err := utils.CheckHTTPStorageURI(storageUri.Uri); err != nil {
+		return err
+	}
 
 	if storageUri.MountPath == "/" {
 		return errors.New("storage path cannot be empty")
@@ -844,6 +847,11 @@ func validateMultipleStorageURIs(isvc *InferenceService) error {
 		if storageURI != nil && storageURIs != nil {
 			return errors.New(InvalidStorageUriConfigError)
 		}
+		if storageURI != nil {
+			if err := utils.CheckHTTPStorageURI(*storageURI); err != nil {
+				return err
+			}
+		}
 
 		if err := validateMultipleStorageURIsSpec(storageURIs); err != nil {
 			return err
@@ -859,6 +867,11 @@ func validateMultipleStorageURIs(isvc *InferenceService) error {
 		if storageURI != nil && storageURIs != nil {
 			return errors.New(InvalidStorageUriConfigError)
 		}
+		if storageURI != nil {
+			if err := utils.CheckHTTPStorageURI(*storageURI); err != nil {
+				return err
+			}
+		}
 
 		if err := validateMultipleStorageURIsSpec(storageURIs); err != nil {
 			return err
@@ -873,6 +886,11 @@ func validateMultipleStorageURIs(isvc *InferenceService) error {
 
 	if storageURI != nil && storageURIs != nil {
 		return errors.New(InvalidStorageUriConfigError)
+	}
+	if storageURI != nil {
+		if err := utils.CheckHTTPStorageURI(*storageURI); err != nil {
+			return err
+		}
 	}
 
 	if err := validateMultipleStorageURIsSpec(storageURIs); err != nil {

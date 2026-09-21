@@ -14,6 +14,7 @@
 
 import io
 import os
+import socket
 import tempfile
 import binascii
 import unittest.mock as mock
@@ -24,7 +25,11 @@ import certifi
 import pytest
 
 from kserve_storage import Storage
-from kserve_storage.kserve_storage import _should_download, _parse_patterns_from_env
+from kserve_storage.kserve_storage import (
+    _assert_http_storage_uri_allowed,
+    _parse_patterns_from_env,
+    _should_download,
+)
 
 STORAGE_MODULE = "kserve_storage.kserve_storage"
 HTTPS_URI_TARGZ = "https://foo.bar/model.tar.gz"
@@ -44,6 +49,84 @@ FILE_ZIP_RAW = binascii.unhexlify(
     "0000000a481000000006d6f64656c2e70746855540d000786c5506086c5506086c5506075780b000104f"
     "50100000414000000504b0506000000000100010057000000590000000000"
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_public_http_dns(monkeypatch):
+    """Keep HTTP unit tests independent from the host's DNS availability."""
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.socket.getaddrinfo",
+        lambda *_args: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://127.0.0.1/model",
+        "http://[::1]/model",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.1/model",
+        "https://kubernetes.default.svc/api",
+        "http://metadata.google.internal/computeMetadata/v1",
+    ],
+)
+def test_http_storage_uri_rejects_internal_targets(uri):
+    with pytest.raises(RuntimeError, match="blocked host or IP"):
+        _assert_http_storage_uri_allowed(uri)
+
+
+def test_http_storage_uri_rejects_private_dns(monkeypatch):
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.socket.getaddrinfo",
+        lambda *_args: [(2, 1, 6, "", ("169.254.169.254", 443))],
+    )
+    with pytest.raises(RuntimeError, match="blocked host or IP"):
+        _assert_http_storage_uri_allowed("https://evil.example/model")
+
+
+def test_http_storage_uri_fails_closed_when_dns_resolution_fails(monkeypatch):
+    def fail_resolution(*_args):
+        raise socket.gaierror(-3, "Temporary failure in name resolution")
+
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.socket.getaddrinfo",
+        fail_resolution,
+    )
+    with pytest.raises(RuntimeError, match="Unable to safely resolve"):
+        _assert_http_storage_uri_allowed("https://unresolved.example/model")
+
+
+def test_http_storage_uri_rejects_redirect_to_internal_target(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.socket.getaddrinfo",
+        lambda *_args: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+    response = mock.MagicMock()
+    response.status_code = 302
+    response.headers = {"Location": "http://169.254.169.254/latest/meta-data"}
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.requests.get", mock.Mock(return_value=response)
+    )
+
+    with pytest.raises(RuntimeError, match="blocked host or IP"):
+        Storage._download_from_uri("https://example.com/model", str(tmp_path))
+    response.close.assert_called_once()
+
+
+def test_http_storage_uri_rejects_private_dns_before_git_dispatch(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        f"{STORAGE_MODULE}.socket.getaddrinfo",
+        lambda *_args: [(2, 1, 6, "", ("10.0.0.1", 443))],
+    )
+    clone = mock.Mock()
+    monkeypatch.setattr("dulwich.porcelain.clone", clone)
+
+    with pytest.raises(RuntimeError, match="blocked host or IP"):
+        Storage.download("https://evil.example/repository.git", str(tmp_path))
+    clone.assert_not_called()
 
 
 def test_storage_local_path():
@@ -606,6 +689,11 @@ def test_git_repo_download_public_repo_no_auth(mock_clone):
     # No username or password should be passed for public repos
     assert "username" not in kwargs
     assert "password" not in kwargs
+
+    # Dulwich/urllib3 re-enters this pool manager for every redirect. A
+    # redirected request is rejected before urllib3 opens a connection.
+    with pytest.raises(RuntimeError, match="blocked host or IP"):
+        kwargs["pool_manager"].urlopen("GET", "http://169.254.169.254/latest/meta-data")
 
 
 # Tests for _should_download and _parse_patterns_from_env
