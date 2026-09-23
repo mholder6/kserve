@@ -85,6 +85,8 @@ _HF_PREFIX = "hf://"
 _MS_PREFIX = "modelscope://"
 _OCI_PREFIX = "oci://"
 _GIT_RE = r"https://.+\.git"
+_SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
+_SENSITIVE_REDIRECT_HEADERS = {"authorization", "cookie", "proxy-authorization"}
 
 
 def _assert_http_storage_uri_allowed(uri: str) -> None:
@@ -132,6 +134,7 @@ def _assert_http_storage_uri_allowed(uri: str) -> None:
         or address.is_link_local
         or address.is_multicast
         or address.is_unspecified
+        or address in _SHARED_ADDRESS_SPACE
         for address in addresses
     ):
         raise RuntimeError(f"HTTP storage URI targets a blocked host or IP: {uri}")
@@ -1749,6 +1752,18 @@ class Storage(object):
                 redirected_uri = urljoin(uri, response.headers["Location"])
                 response.close()
                 _assert_http_storage_uri_allowed(redirected_uri)
+                current = urlparse(uri)
+                redirected = urlparse(redirected_uri)
+                if (current.scheme, current.hostname, current.port) != (
+                    redirected.scheme,
+                    redirected.hostname,
+                    redirected.port,
+                ):
+                    headers = {
+                        name: value
+                        for name, value in headers.items()
+                        if name.lower() not in _SENSITIVE_REDIRECT_HEADERS
+                    }
                 uri = redirected_uri
                 response = requests.get(
                     uri,

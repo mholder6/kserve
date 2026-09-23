@@ -17,6 +17,8 @@ limitations under the License.
 package utils
 
 import (
+	"context"
+	"errors"
 	"net"
 	"net/http"
 	"testing"
@@ -35,6 +37,8 @@ func TestCheckHTTPStorageURI(t *testing.T) {
 		{uri: "http://localhost/model", blocked: true},
 		{uri: "http://169.254.169.254/latest/meta-data", blocked: true},
 		{uri: "http://10.0.0.1/model", blocked: true},
+		{uri: "http://100.64.0.1/model", blocked: true},
+		{uri: "http://100.127.255.254/model", blocked: true},
 		{uri: "https://kubernetes.default.svc/api", blocked: true},
 		{uri: "http://2130706433/model", blocked: true},
 		{uri: "http://0177.0.0.1/model", blocked: true},
@@ -47,6 +51,61 @@ func TestCheckHTTPStorageURI(t *testing.T) {
 				t.Fatalf("CheckHTTPStorageURI() error = %v, blocked = %v", err, test.blocked)
 			}
 		})
+	}
+}
+
+func TestSafeHTTPClientBlocksDNSRebinding(t *testing.T) {
+	original := lookupIPFn
+	t.Cleanup(func() { lookupIPFn = original })
+	lookups := 0
+	lookupIPFn = func(string) ([]net.IP, error) {
+		lookups++
+		if lookups == 1 {
+			return []net.IP{net.ParseIP("93.184.216.34")}, nil
+		}
+		return []net.IP{net.ParseIP("10.0.0.1")}, nil
+	}
+
+	if err := CheckHTTPStorageURIResolved("https://rebind.example/model"); err != nil {
+		t.Fatalf("initial public resolution failed: %v", err)
+	}
+
+	baseDialCalled := false
+	baseTransport := &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			baseDialCalled = true
+			return nil, errors.New("unexpected dial")
+		},
+	}
+	client := SafeHTTPClient(&http.Client{Transport: baseTransport})
+	transport := client.Transport.(*http.Transport)
+	if _, err := transport.DialContext(t.Context(), "tcp", "rebind.example:443"); err == nil {
+		t.Fatal("expected rebound private address to be rejected")
+	}
+	if baseDialCalled {
+		t.Fatal("private rebound address reached the underlying dialer")
+	}
+}
+
+func TestSafeHTTPClientDialsValidatedIP(t *testing.T) {
+	original := lookupIPFn
+	t.Cleanup(func() { lookupIPFn = original })
+	lookupIPFn = func(string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("93.184.216.34")}, nil
+	}
+
+	var dialedAddress string
+	baseTransport := &http.Transport{
+		DialContext: func(_ context.Context, _, address string) (net.Conn, error) {
+			dialedAddress = address
+			return nil, errors.New("stop after capturing address")
+		},
+	}
+	client := SafeHTTPClient(&http.Client{Transport: baseTransport})
+	transport := client.Transport.(*http.Transport)
+	_, _ = transport.DialContext(t.Context(), "tcp", "public.example:443")
+	if dialedAddress != "93.184.216.34:443" {
+		t.Fatalf("dialed %q, want validated IP", dialedAddress)
 	}
 }
 

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import io
+import json
 import os
 import socket
 import tempfile
@@ -67,6 +68,8 @@ def mock_public_http_dns(monkeypatch):
         "http://[::1]/model",
         "http://169.254.169.254/latest/meta-data",
         "http://10.0.0.1/model",
+        "http://100.64.0.1/model",
+        "http://100.127.255.254/model",
         "https://kubernetes.default.svc/api",
         "http://metadata.google.internal/computeMetadata/v1",
     ],
@@ -112,6 +115,37 @@ def test_http_storage_uri_rejects_redirect_to_internal_target(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="blocked host or IP"):
         Storage._download_from_uri("https://example.com/model", str(tmp_path))
     response.close.assert_called_once()
+
+
+def test_http_storage_uri_strips_sensitive_headers_on_cross_origin_redirect(
+    monkeypatch, tmp_path
+):
+    redirect = mock.MagicMock()
+    redirect.status_code = 302
+    redirect.headers = {"Location": "https://other.example/model"}
+    success = MockHttpResponse(
+        status_code=200,
+        raw=b"model",
+        content_type="application/octet-stream",
+    )
+    request = mock.Mock(side_effect=[redirect, success])
+    monkeypatch.setattr(f"{STORAGE_MODULE}.requests.get", request)
+    headers = {
+        "Authorization": "Bearer secret",
+        "Cookie": "session=secret",
+        "Proxy-Authorization": "Basic secret",
+        "X-Model-Header": "preserved",
+    }
+
+    with mock.patch.dict(
+        os.environ,
+        {"example.com-headers": json.dumps(headers)},
+    ):
+        Storage._download_from_uri("https://example.com/model", str(tmp_path))
+
+    redirected_headers = request.call_args_list[1].kwargs["headers"]
+    assert redirected_headers == {"X-Model-Header": "preserved"}
+    redirect.close.assert_called_once()
 
 
 def test_http_storage_uri_rejects_private_dns_before_git_dispatch(

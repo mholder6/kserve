@@ -33,6 +33,8 @@ const ErrBlockedHTTPStorageURI = "http(s) storageUri %q targets a blocked host o
 
 var lookupIPFn = net.LookupIP
 
+var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
+
 // CheckHTTPStorageURI rejects http(s) URIs whose host is a blocked IP literal
 // or a well-known internal/metadata hostname. Non-http(s) URIs are ignored.
 // DNS is deliberately not resolved so admission remains offline-safe.
@@ -72,23 +74,43 @@ func checkHTTPStorageHost(host string, resolve bool) error {
 	if !resolve {
 		return nil
 	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return nil
+	_, err := resolveHTTPStorageHost(host)
+	return err
+}
+
+func resolveHTTPStorageHost(host string) ([]netip.Addr, error) {
+	if isBlockedHostname(host) || isObfuscatedIPv4(host) {
+		return nil, fmt.Errorf("blocked host %q", host)
+	}
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if isBlockedAddr(addr) {
+			return nil, fmt.Errorf("blocked IP %s", addr)
+		}
+		return []netip.Addr{addr.Unmap()}, nil
 	}
 	ips, err := lookupIPFn(host)
 	if err != nil {
-		return fmt.Errorf("resolve host %q: %w", host, err)
+		return nil, fmt.Errorf("resolve host %q: %w", host, err)
 	}
 	if len(ips) == 0 {
-		return fmt.Errorf("host %q resolved to no addresses", host)
+		return nil, fmt.Errorf("host %q resolved to no addresses", host)
 	}
+	addresses := make([]netip.Addr, 0, len(ips))
 	for _, ip := range ips {
 		addr, ok := netip.AddrFromSlice(ip)
-		if ok && isBlockedAddr(addr) {
-			return fmt.Errorf("blocked resolved IP %s for host %q", addr, host)
+		if !ok {
+			continue
 		}
+		addr = addr.Unmap()
+		if isBlockedAddr(addr) {
+			return nil, fmt.Errorf("blocked resolved IP %s for host %q", addr, host)
+		}
+		addresses = append(addresses, addr)
 	}
-	return nil
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("host %q resolved to no usable addresses", host)
+	}
+	return addresses, nil
 }
 
 func isBlockedHostname(host string) bool {
@@ -115,7 +137,7 @@ func isBlockedAddr(addr netip.Addr) bool {
 	addr = addr.Unmap()
 	return addr.IsLoopback() || addr.IsPrivate() ||
 		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified()
+		addr.IsMulticast() || addr.IsUnspecified() || sharedAddressSpace.Contains(addr)
 }
 
 // Catch dword and octal spellings that URL parsers may pass to HTTP stacks.
@@ -179,14 +201,23 @@ func wrapSafeTransport(roundTripper http.RoundTripper) http.RoundTripper {
 		baseDial = dialer.DialContext
 	}
 	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-		host, _, err := net.SplitHostPort(address)
+		host, port, err := net.SplitHostPort(address)
 		if err != nil {
-			host = address
+			return nil, fmt.Errorf("invalid HTTP storage address %q: %w", address, err)
 		}
-		if err := checkHTTPStorageHost(host, true); err != nil {
+		addresses, err := resolveHTTPStorageHost(host)
+		if err != nil {
 			return nil, fmt.Errorf(ErrBlockedHTTPStorageURI, address)
 		}
-		return baseDial(ctx, network, address)
+		var lastErr error
+		for _, resolved := range addresses {
+			conn, dialErr := baseDial(ctx, network, net.JoinHostPort(resolved.String(), port))
+			if dialErr == nil {
+				return conn, nil
+			}
+			lastErr = dialErr
+		}
+		return nil, fmt.Errorf("failed to dial validated addresses for %q: %w", host, lastErr)
 	}
 	return transport
 }
