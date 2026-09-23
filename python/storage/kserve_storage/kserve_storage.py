@@ -89,11 +89,11 @@ _SHARED_ADDRESS_SPACE = ipaddress.ip_network("100.64.0.0/10")
 _SENSITIVE_REDIRECT_HEADERS = {"authorization", "cookie", "proxy-authorization"}
 
 
-def _assert_http_storage_uri_allowed(uri: str) -> None:
+def _resolve_http_storage_uri(uri: str) -> tuple[str, ...]:
     """Reject HTTP(S) model locations which target non-public networks."""
     parsed = urlparse(uri)
     if parsed.scheme.lower() not in ("http", "https"):
-        return
+        return ()
     host = parsed.hostname
     normalized_host = (host or "").rstrip(".").lower()
     if (
@@ -138,6 +138,67 @@ def _assert_http_storage_uri_allowed(uri: str) -> None:
         for address in addresses
     ):
         raise RuntimeError(f"HTTP storage URI targets a blocked host or IP: {uri}")
+    return tuple(str(address) for address in addresses)
+
+
+def _assert_http_storage_uri_allowed(uri: str) -> None:
+    _resolve_http_storage_uri(uri)
+
+
+class _PinnedHTTPAdapter(requests.adapters.HTTPAdapter):
+    """Dial a validated IP while authenticating the original HTTP host."""
+
+    def __init__(self, uri: str, address: str):
+        parsed = urlparse(uri)
+        self._original_host = parsed.hostname
+        self._original_port = parsed.port
+        self._address = address
+        super().__init__()
+
+    def send(self, request, *args, **kwargs):
+        parsed = urlparse(request.url)
+        address = f"[{self._address}]" if ":" in self._address else self._address
+        port = f":{parsed.port}" if parsed.port is not None else ""
+        request.url = parsed._replace(netloc=f"{address}{port}").geturl()
+
+        original_host = self._original_host
+        if ":" in original_host:
+            original_host = f"[{original_host}]"
+        original_port = (
+            f":{self._original_port}" if self._original_port is not None else ""
+        )
+        request.headers["Host"] = f"{original_host}{original_port}"
+        return super().send(request, *args, **kwargs)
+
+    def build_connection_pool_key_attributes(self, request, verify, cert=None):
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        if urlparse(request.url).scheme.lower() == "https":
+            pool_kwargs["server_hostname"] = self._original_host
+            pool_kwargs["assert_hostname"] = self._original_host
+        return host_params, pool_kwargs
+
+
+def _pinned_http_get(uri: str, **kwargs):
+    addresses = _resolve_http_storage_uri(uri)
+    last_error = None
+    for address in addresses:
+        try:
+            with requests.Session() as session:
+                session.mount(
+                    f"{urlparse(uri).scheme.lower()}://",
+                    _PinnedHTTPAdapter(uri, address),
+                )
+                return session.get(uri, **kwargs)
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+        ) as error:
+            last_error = error
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unable to safely resolve HTTP storage URI host: {uri}")
 
 
 class _GuardedHTTPPoolMixin:
@@ -1735,7 +1796,7 @@ class Storage(object):
         headers = json.loads(headers_json)
 
         try:
-            response = requests.get(
+            response = _pinned_http_get(
                 uri,
                 stream=True,
                 headers=headers,
@@ -1751,7 +1812,6 @@ class Storage(object):
                     raise RuntimeError("Too many redirects while downloading model")
                 redirected_uri = urljoin(uri, response.headers["Location"])
                 response.close()
-                _assert_http_storage_uri_allowed(redirected_uri)
                 current = urlparse(uri)
                 redirected = urlparse(redirected_uri)
                 if (current.scheme, current.hostname, current.port) != (
@@ -1765,7 +1825,7 @@ class Storage(object):
                         if name.lower() not in _SENSITIVE_REDIRECT_HEADERS
                     }
                 uri = redirected_uri
-                response = requests.get(
+                response = _pinned_http_get(
                     uri,
                     stream=True,
                     headers=headers,

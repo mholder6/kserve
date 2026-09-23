@@ -24,11 +24,13 @@ from pathlib import Path
 
 import certifi
 import pytest
+import requests
 
 from kserve_storage import Storage
 from kserve_storage.kserve_storage import (
     _assert_http_storage_uri_allowed,
     _parse_patterns_from_env,
+    _pinned_http_get,
     _should_download,
 )
 
@@ -109,7 +111,7 @@ def test_http_storage_uri_rejects_redirect_to_internal_target(monkeypatch, tmp_p
     response.status_code = 302
     response.headers = {"Location": "http://169.254.169.254/latest/meta-data"}
     monkeypatch.setattr(
-        f"{STORAGE_MODULE}.requests.get", mock.Mock(return_value=response)
+        f"{STORAGE_MODULE}.requests.Session.get", mock.Mock(return_value=response)
     )
 
     with pytest.raises(RuntimeError, match="blocked host or IP"):
@@ -129,7 +131,7 @@ def test_http_storage_uri_strips_sensitive_headers_on_cross_origin_redirect(
         content_type="application/octet-stream",
     )
     request = mock.Mock(side_effect=[redirect, success])
-    monkeypatch.setattr(f"{STORAGE_MODULE}.requests.get", request)
+    monkeypatch.setattr(f"{STORAGE_MODULE}.requests.Session.get", request)
     headers = {
         "Authorization": "Bearer secret",
         "Cookie": "session=secret",
@@ -146,6 +148,48 @@ def test_http_storage_uri_strips_sensitive_headers_on_cross_origin_redirect(
     redirected_headers = request.call_args_list[1].kwargs["headers"]
     assert redirected_headers == {"X-Model-Header": "preserved"}
     redirect.close.assert_called_once()
+
+
+def test_http_storage_uri_pins_validated_ip_against_dns_rebinding(monkeypatch):
+    lookups = 0
+
+    def changing_dns(*_args):
+        nonlocal lookups
+        lookups += 1
+        address = "93.184.216.34" if lookups == 1 else "10.0.0.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, 443))]
+
+    captured = {}
+
+    def fake_adapter_send(adapter, request, *args, **kwargs):
+        captured["url"] = request.url
+        captured["host"] = request.headers["Host"]
+        _, pool_kwargs = adapter.build_connection_pool_key_attributes(request, True)
+        captured["server_hostname"] = pool_kwargs["server_hostname"]
+        captured["assert_hostname"] = pool_kwargs["assert_hostname"]
+        return MockHttpResponse(
+            status_code=200,
+            raw=b"model",
+            content_type="application/octet-stream",
+        )
+
+    def fake_session_get(session, uri, **kwargs):
+        request = requests.Request("GET", uri, headers=kwargs.get("headers")).prepare()
+        return session.adapters["https://"].send(request)
+
+    monkeypatch.setattr(f"{STORAGE_MODULE}.socket.getaddrinfo", changing_dns)
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", fake_adapter_send)
+    monkeypatch.setattr(requests.Session, "get", fake_session_get)
+
+    _pinned_http_get("https://rebind.example/model", stream=True, timeout=30)
+
+    assert lookups == 1
+    assert captured == {
+        "url": "https://93.184.216.34/model",
+        "host": "rebind.example",
+        "server_hostname": "rebind.example",
+        "assert_hostname": "rebind.example",
+    }
 
 
 def test_http_storage_uri_rejects_private_dns_before_git_dispatch(
@@ -209,7 +253,7 @@ class MockHttpResponse(object):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -224,7 +268,7 @@ def test_http_uri_path(_):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -255,7 +299,7 @@ mjrvDJwPyARHZg==
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -272,7 +316,7 @@ def test_https_uri_path_without_global_ca_bundle(_):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -299,7 +343,7 @@ def test_https_uri_path_with_global_ca_bundle(_, tmp_path):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -321,7 +365,7 @@ def test_https_uri_path_keeps_existing_ca_bundle_env(_, tmp_path):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -344,7 +388,7 @@ def test_https_uri_path_fills_unset_ca_bundle_env(_, tmp_path):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -390,7 +434,7 @@ def test_hdfs_uri_path_keeps_own_tls_configuration(_, uri, tmp_path):
 
 
 @mock.patch(
-    "requests.get",
+    "requests.Session.get",
     return_value=MockHttpResponse(
         status_code=200, content_type="application/octet-stream"
     ),
@@ -523,7 +567,7 @@ def test_http_uri_paths(uri, response, expected_error):
                 assert Storage.download(uri, out_dir=out_dir) == out_dir
                 assert os.path.exists(os.path.join(out_dir, "model.pth"))
 
-    mock.patch("requests.get", return_value=response)(test)()
+    mock.patch("requests.Session.get", return_value=response)(test)()
 
 
 def test_storage_blob_exception():
