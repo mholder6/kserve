@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestCheckHTTPStorageURI(t *testing.T) {
@@ -43,6 +44,11 @@ func TestCheckHTTPStorageURI(t *testing.T) {
 		{uri: "http://2130706433/model", blocked: true},
 		{uri: "http://0177.0.0.1/model", blocked: true},
 		{uri: "http://[fd00::1]/model", blocked: true},
+		{uri: "http://192.0.2.1/model", blocked: true},
+		{uri: "http://198.18.0.1/model", blocked: true},
+		{uri: "http://203.0.113.1/model", blocked: true},
+		{uri: "http://[2001:db8::1]/model", blocked: true},
+		{uri: "http://[2002::1]/model", blocked: true},
 	}
 	for _, test := range tests {
 		t.Run(test.uri, func(t *testing.T) {
@@ -51,6 +57,20 @@ func TestCheckHTTPStorageURI(t *testing.T) {
 				t.Fatalf("CheckHTTPStorageURI() error = %v, blocked = %v", err, test.blocked)
 			}
 		})
+	}
+}
+
+func TestSafeHTTPClientDisablesProxy(t *testing.T) {
+	client := SafeHTTPClient(&http.Client{Transport: &http.Transport{Proxy: http.ProxyFromEnvironment}})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", client.Transport)
+	}
+	if transport.Proxy != nil {
+		t.Fatal("expected proxy routing to be disabled")
+	}
+	if transport.ResponseHeaderTimeout != 30*time.Second {
+		t.Fatalf("response header timeout = %s, want 30s", transport.ResponseHeaderTimeout)
 	}
 }
 

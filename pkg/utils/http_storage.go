@@ -35,6 +35,18 @@ var lookupIPFn = net.LookupIP
 
 var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
 
+var blockedSpecialPurposePrefixes = []netip.Prefix{
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
 // CheckHTTPStorageURI rejects http(s) URIs whose host is a blocked IP literal
 // or a well-known internal/metadata hostname. Non-http(s) URIs are ignored.
 // DNS is deliberately not resolved so admission remains offline-safe.
@@ -135,9 +147,17 @@ func isBlockedIPLiteral(host string) bool {
 
 func isBlockedAddr(addr netip.Addr) bool {
 	addr = addr.Unmap()
-	return addr.IsLoopback() || addr.IsPrivate() ||
+	if addr.IsLoopback() || addr.IsPrivate() ||
 		addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() ||
-		addr.IsMulticast() || addr.IsUnspecified() || sharedAddressSpace.Contains(addr)
+		addr.IsMulticast() || addr.IsUnspecified() || sharedAddressSpace.Contains(addr) {
+		return true
+	}
+	for _, prefix := range blockedSpecialPurposePrefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return addr.Is6() && !netip.MustParsePrefix("2000::/3").Contains(addr)
 }
 
 // Catch dword and octal spellings that URL parsers may pass to HTTP stacks.
@@ -195,6 +215,9 @@ func wrapSafeTransport(roundTripper http.RoundTripper) http.RoundTripper {
 	default:
 		return roundTripper
 	}
+	// A proxy resolves the destination outside our validated dial path.
+	transport.Proxy = nil
+	transport.ResponseHeaderTimeout = 30 * time.Second
 	baseDial := transport.DialContext
 	if baseDial == nil {
 		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
